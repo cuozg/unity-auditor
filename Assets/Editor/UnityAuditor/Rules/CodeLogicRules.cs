@@ -1,26 +1,15 @@
-using System.Collections.Generic;
-using System.IO;
-using System.Text.RegularExpressions;
-
+#if UNITY_EDITOR
 namespace UnityAuditor.Rules
 {
     /// <summary>
-    /// Scans C# source files for Unity code-logic pitfalls:
-    ///   - Unity Object null checks using == null (operator overload trap)
-    ///   - Camera.main in Update/FixedUpdate/LateUpdate
-    ///   - Find* calls outside Awake/Start
-    ///   - Empty catch blocks
-    ///   - Coroutine started without null guard
-    ///   - GetComponent inside Update loop
+    /// P1/P2 code logic rules: Unity null checks, Camera.main in Update,
+    /// Find* at runtime, empty catch, GetComponent in Update, coroutine/destroy guards.
     /// </summary>
-    public class CodeLogicRules : IAuditRule
+    public sealed class CodeLogicRules : RegexRuleBase
     {
-        public RuleCategory Category => RuleCategory.CodeLogic;
+        public override RuleCategory Category => RuleCategory.CodeLogic;
 
-        // ---------------------------------------------------------------
-        // Rule patterns: (ruleId, title, pattern, severity, why, fix)
-        // ---------------------------------------------------------------
-        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules =
+        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] _rules =
         {
             (
                 "CL001",
@@ -80,55 +69,39 @@ namespace UnityAuditor.Rules
                 "Calling Destroy(null) is safe, but Destroy on an already-destroyed object logs a warning.",
                 "Use `if (obj != null) Destroy(obj);` for clarity and to suppress spurious warnings."
             ),
+            (
+                "CL008",
+                "Coroutine method (IEnumerator) without any yield return",
+                @"IEnumerator\s+\w+\s*\([^)]*\)\s*\{(?:(?!yield\s+return)[^}])*\}",
+                Severity.P1_MustFix,
+                "An IEnumerator method without yield executes entirely in one frame — defeating the purpose " +
+                "of coroutines. The method will run to completion synchronously when StartCoroutine is called.",
+                "Add yield return statements (e.g., yield return null, yield return new WaitForSeconds(1f)) " +
+                "or change the return type to void if coroutine behavior is not needed."
+            ),
+            (
+                "CL009",
+                "async void method declaration (should be async Task)",
+                @"async\s+void\s+\w+\s*\(",
+                Severity.P1_MustFix,
+                "async void methods swallow exceptions silently and cannot be awaited. Exceptions thrown " +
+                "will crash the application without any catch opportunity.",
+                "Change to 'async Task MethodName()' and await the result. Only use async void for Unity " +
+                "event handlers like button onClick handlers."
+            ),
+            (
+                "CL010",
+                "UnityEvent.Invoke() called without listener/null guard",
+                @"\.Invoke\s*\(\s*\)",
+                Severity.P2_Suggestion,
+                "Invoking a UnityEvent with zero persistent listeners is a no-op that can indicate a " +
+                "misconfigured event wiring in the Inspector.",
+                "Check GetPersistentEventCount() > 0 before invoking, or verify the event has listeners " +
+                "wired in the Inspector."
+            ),
         };
 
-        public List<AuditFinding> Scan(string assetsRoot)
-        {
-            var findings = new List<AuditFinding>();
-            foreach (var csFile in Directory.GetFiles(assetsRoot, "*.cs", SearchOption.AllDirectories))
-            {
-                // Skip generated and Editor-only test files
-                if (csFile.Contains("Generated") || csFile.Contains(".Designer.")) continue;
-
-                var lines = File.ReadAllLines(csFile);
-                var fullText = string.Join("\n", lines);
-                var relativePath = MakeRelative(csFile, assetsRoot);
-
-                foreach (var rule in Rules)
-                {
-                    var matches = Regex.Matches(fullText, rule.pattern,
-                        RegexOptions.Singleline | RegexOptions.IgnoreCase);
-
-                    foreach (Match match in matches)
-                    {
-                        int lineNum = CountLines(fullText, match.Index);
-                        findings.Add(new AuditFinding
-                        {
-                            Severity     = rule.sev,
-                            Category     = RuleCategory.CodeLogic,
-                            RuleId       = rule.id,
-                            Title        = rule.title,
-                            FilePath     = relativePath,
-                            Line         = lineNum,
-                            Detail       = match.Value.Trim(),
-                            WhyItMatters = rule.why,
-                            HowToFix     = rule.fix,
-                        });
-                    }
-                }
-            }
-            return findings;
-        }
-
-        private static int CountLines(string text, int charIndex)
-        {
-            int line = 1;
-            for (int i = 0; i < charIndex && i < text.Length; i++)
-                if (text[i] == '\n') line++;
-            return line;
-        }
-
-        private static string MakeRelative(string fullPath, string root) =>
-            fullPath.StartsWith(root) ? fullPath.Substring(root.Length).TrimStart('/', '\\') : fullPath;
+        protected override (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules => _rules;
     }
 }
+#endif

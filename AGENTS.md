@@ -10,18 +10,24 @@ Automated static analysis tool for Unity C# projects. 37 rules across 6 categori
 
 ```
 Assets/Editor/UnityAuditor/
-├── AuditFinding.cs           # Enums (Severity, RuleCategory), AuditFinding data class, IAuditRule interface
-├── AuditEngine.cs            # Static orchestrator — RunAll(), RunCategory(), GetAllRules() registry
-├── UnityAuditorWindow.cs     # IMGUI EditorWindow (Tools > Unity Auditor), filtering, detail panels
+├── UnityAuditor.Editor.asmdef  # Assembly definition — Editor-only platform
+├── Severity.cs                 # Enum: P0_BlockMerge, P1_MustFix, P2_Suggestion
+├── RuleCategory.cs             # Enum: CodeLogic, Serialization, Security, Performance, PrefabIntegrity, AssetSettings
+├── IAuditRule.cs               # Interface: Category + Scan(assetsRoot)
+├── AuditFinding.cs             # Sealed DTO: finding data class
+├── ScannerUtility.cs           # Internal static helpers: CountLines, MakeRelative, CombineArrays
+├── AuditEngine.cs              # Static orchestrator — RunAll(), RunCategory(), GetAllRules() registry
+├── UnityAuditorWindow.cs       # Sealed IMGUI EditorWindow (Tools > Unity Auditor)
 ├── Rules/
-│   ├── SecurityRules.cs      # 6 P0 rules — secrets, RCE, HTTP, WWW class
-│   ├── CodeLogicRules.cs     # 7 P1 rules — Camera.main, Find*, empty catch, null checks
-│   ├── SerializationRules.cs # 6 P1 rules — Dictionary, BinaryFormatter, non-serializable types
-│   ├── PerformanceRules.cs   # 7 P1 rules — allocations in Update, SendMessage, Debug.Log
-│   ├── PrefabRules.cs        # 4 P1 rules — missing scripts, broken prefab variants
-│   └── AssetSettingsRules.cs # 7 P2 rules — texture/mesh/audio import settings
+│   ├── RegexRuleBase.cs        # Abstract base for regex-over-source rules (DRY scanning loop)
+│   ├── SecurityRules.cs        # 6 P0 rules — secrets, RCE, HTTP, WWW class (extends RegexRuleBase)
+│   ├── CodeLogicRules.cs       # 7 P1 rules — Camera.main, Find*, empty catch (extends RegexRuleBase)
+│   ├── SerializationRules.cs   # 6 P1 rules — Dictionary, BinaryFormatter (extends RegexRuleBase)
+│   ├── PerformanceRules.cs     # 7 P1 rules — allocations in Update, SendMessage (extends RegexRuleBase)
+│   ├── PrefabRules.cs          # 4 P1 rules — missing scripts, broken prefab variants (direct IAuditRule)
+│   └── AssetSettingsRules.cs   # 7 P2 rules — texture/mesh/audio import settings (direct IAuditRule)
 └── Scripts/
-    └── unity_auditor.py      # Headless Python scanner (mirrors C# rules via regex)
+    └── unity_auditor.py        # Headless Python scanner (mirrors C# rules via regex)
 ```
 
 ### Data Flow
@@ -42,18 +48,22 @@ Assets/Editor/UnityAuditor/
 
 ## Code Conventions
 
-- **Namespace**: `UnityAuditor` (core), `UnityAuditor.Rules` (rule implementations)
-- **Naming**: PascalCase for classes/methods/properties/static fields, camelCase for locals
+- **Namespace**: `UnityAuditor` (core types), `UnityAuditor.Rules` (rule implementations)
+- **Assembly**: `UnityAuditor.Editor.asmdef` — Editor-only platform, `autoReferenced: false`
+- **One type per file**: File name matches type name (`Severity.cs` → `enum Severity`)
+- **Sealed by default**: All concrete classes are `sealed` unless designed for inheritance
+- **Naming**: PascalCase for classes/methods/properties/static fields, `_camelCase` for private fields, camelCase for locals
 - **Indentation**: 4 spaces, Allman braces
 - **Documentation**: XML `<summary>` on all public API members
 - **Error handling**: try-catch at orchestration level only; `Debug.LogError` with `[UnityAuditor]` prefix
-- **Conditional compilation**: All editor code wrapped in `#if UNITY_EDITOR`
-- **Field alignment**: Vertically aligned in data classes (see `AuditFinding.cs`)
+- **Conditional compilation**: All editor code wrapped in `#if UNITY_EDITOR` (redundant but portable with asmdef)
+- **Field ordering**: Constants → Static → Serialized → Private → Properties → Unity callbacks → Public methods → Private methods
+- **Section headers**: `// --- Section ---` comment style (no `#region`)
 - **No `.editorconfig`** — conventions enforced by existing code patterns only
 
 ## Key Interfaces
 
-### IAuditRule (AuditFinding.cs)
+### IAuditRule (IAuditRule.cs)
 
 ```csharp
 public interface IAuditRule
@@ -67,26 +77,43 @@ Every rule class implements this interface. `Scan()` receives the project's Asse
 
 ### AuditFinding (AuditFinding.cs)
 
-Fields: `Severity`, `Category`, `RuleId`, `Title`, `FilePath`, `Line`, `Detail`, `WhyItMatters`, `HowToFix`.
+Sealed DTO with public fields: `Severity`, `Category`, `RuleId`, `Title`, `FilePath`, `Line`, `Detail`, `WhyItMatters`, `HowToFix`.
+
+### RegexRuleBase (Rules/RegexRuleBase.cs)
+
+Abstract base class for the 4 regex-over-source rule files. Provides:
+- Shared file iteration and regex matching loop
+- `ShouldSkipFile()` virtual hook (default skips Generated/.Designer. files)
+- Subclasses define `Category` and `Rules` array only
 
 ### AuditEngine (AuditEngine.cs)
 
 Static class. `GetAllRules()` returns all rule instances (manual registry). `RunAll()` and `RunCategory()` orchestrate scanning.
 
+### ScannerUtility (ScannerUtility.cs)
+
+Internal static helpers shared across rule implementations: `CountLines()`, `MakeRelative()`, `CombineArrays()`.
+
 ## How to Add a New Rule
 
-1. Create a class implementing `IAuditRule` in `Assets/Editor/UnityAuditor/Rules/`
-2. Set `Category` property to the appropriate `RuleCategory` enum value
-3. Implement `Scan(string assetsRoot)` — use regex for source scanning, `AssetDatabase`/`AssetImporter` for asset inspection
-4. **Register the rule** in `AuditEngine.GetAllRules()` — this is a manual step; forgetting it means the rule never runs
-5. Mirror the rule in `Scripts/unity_auditor.py` for CI parity (rules defined as tuples in category arrays like `SEC_RULES`, `PERF_RULES`)
-6. Follow the existing rule ID convention: category prefix + 3-digit number (e.g., `SEC001`, `CL001`, `PERF001`)
+### Regex-based rule (source code scanning)
+
+1. Add rule tuples to the `_rules` array in the appropriate `RegexRuleBase` subclass
+2. Follow the rule ID convention: category prefix + 3-digit number (e.g., `SEC007`, `CL008`)
+3. **Register if new class**: If creating a new rule class, register in `AuditEngine.GetAllRules()`
+
+### Asset/Prefab rule (AssetDatabase scanning)
+
+1. Create a `sealed` class implementing `IAuditRule` in `Assets/Editor/UnityAuditor/Rules/`
+2. Use `ScannerUtility` for shared helpers (`CountLines`, `MakeRelative`)
+3. **Register the rule** in `AuditEngine.GetAllRules()` — forgetting this means the rule never runs
+4. Mirror the rule in `Scripts/unity_auditor.py` for CI parity
 
 ## Rule Implementation Patterns
 
-- **Source code rules** (Security, CodeLogic, Performance, Serialization): Use regex patterns over `.cs` file contents. Rules are defined as static arrays of tuples containing `(RuleId, Title, RegexPattern, Severity, WhyItMatters, HowToFix)`.
-- **Asset rules** (AssetSettings): Use `AssetDatabase.FindAssets()` + `AssetImporter` to inspect import settings on textures, models, audio.
-- **Prefab/scene rules** (PrefabIntegrity): Scan `.prefab` and `.unity` YAML files for structural issues (missing script GUIDs, broken variant references).
+- **Source code rules** (Security, CodeLogic, Performance, Serialization): Extend `RegexRuleBase`. Define a static `_rules` array of tuples `(RuleId, Title, RegexPattern, Severity, WhyItMatters, HowToFix)` and override `Rules` property.
+- **Asset rules** (AssetSettings): Use `AssetDatabase.FindAssets()` + `AssetImporter` to inspect import settings.
+- **Prefab/scene rules** (PrefabIntegrity): Scan `.prefab`/`.unity` YAML files with regex + `AssetDatabase` checks.
 
 ## CI/CD
 
@@ -112,6 +139,6 @@ No formal test suite (NUnit/UTF) exists. Validation relies on:
 ## Dependencies
 
 - **Unity**: Editor-only tool (all code under `Assets/Editor/`)
+- **Assembly definition**: `UnityAuditor.Editor.asmdef` — Editor platform only
 - **Python**: 3.9+ for CI scanner (zero external deps)
 - **No UPM package.json** — distributed by copying `Assets/Editor/UnityAuditor/` into target projects
-- **No assembly definition (.asmdef)** provided by default

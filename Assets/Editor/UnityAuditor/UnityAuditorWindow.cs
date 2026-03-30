@@ -9,45 +9,63 @@ using UnityEngine;
 namespace UnityAuditor
 {
     /// <summary>
-    /// Unity EditorWindow that runs all audit checks against the current project
+    /// IMGUI EditorWindow that runs all audit checks against the current project
     /// and displays findings with severity badges, category tabs, fix hints, and file-jump links.
-    ///
     /// Open via: Tools > Unity Auditor
     /// </summary>
-    public class UnityAuditorWindow : EditorWindow
+    public sealed class UnityAuditorWindow : EditorWindow
     {
         // ---------------------------------------------------------------
-        // Menu
+        // Constants
         // ---------------------------------------------------------------
 
-        [MenuItem("Tools/Unity Auditor", priority = 1000)]
-        public static void ShowWindow()
+        private static readonly string[] TabNames =
         {
-            var wnd = GetWindow<UnityAuditorWindow>("Unity Auditor");
-            wnd.minSize = new Vector2(700, 500);
-        }
+            "All", "Code Logic", "Serialization", "Security", "Performance",
+            "Prefabs", "Assets", "Lifecycle", "Architecture", "Optimization",
+        };
+
+        private static readonly RuleCategory?[] TabCategories =
+        {
+            null,
+            RuleCategory.CodeLogic,
+            RuleCategory.Serialization,
+            RuleCategory.Security,
+            RuleCategory.Performance,
+            RuleCategory.PrefabIntegrity,
+            RuleCategory.AssetSettings,
+            RuleCategory.Lifecycle,
+            RuleCategory.Architecture,
+            RuleCategory.Optimization,
+        };
 
         // ---------------------------------------------------------------
-        // State
+        // Scan state
         // ---------------------------------------------------------------
 
-        private List<AuditFinding> _allFindings   = new List<AuditFinding>();
-        private bool                  _isScanning    = false;
-        private float                 _scanProgress  = 0f;
-        private string                _scanStatus    = "";
-        private DateTime              _lastScanTime;
-        private bool                  _hasScanned    = false;
+        private List<AuditFinding> _allFindings = new List<AuditFinding>();
+        private bool     _isScanning;
+        private float    _scanProgress;
+        private string   _scanStatus = "";
+        private DateTime _lastScanTime;
+        private bool     _hasScanned;
 
-        // Filtering
-        private int                   _selectedTab   = 0;  // 0 = All
-        private Severity?             _severityFilter = null;
-        private string                _searchText    = "";
-        private Vector2               _scrollPos;
+        // ---------------------------------------------------------------
+        // Filter state
+        // ---------------------------------------------------------------
 
-        // Detail panel
-        private AuditFinding       _selectedFinding;
-        private Vector2               _detailScroll;
-        private bool                  _showDetail    = false;
+        private int       _selectedTab;
+        private Severity? _severityFilter;
+        private string    _searchText = "";
+        private Vector2   _scrollPos;
+
+        // ---------------------------------------------------------------
+        // Detail panel state
+        // ---------------------------------------------------------------
+
+        private AuditFinding _selectedFinding;
+        private Vector2      _detailScroll;
+        private bool         _showDetail;
 
         // ---------------------------------------------------------------
         // Styles (lazy-initialized)
@@ -61,72 +79,16 @@ namespace UnityAuditor
         private GUIStyle _rowNormalStyle;
         private bool     _stylesInitialized;
 
-        private void InitStyles()
-        {
-            if (_stylesInitialized) return;
-            _stylesInitialized = true;
-
-            _headerStyle = new GUIStyle(EditorStyles.boldLabel)
-            {
-                fontSize = 13,
-                alignment = TextAnchor.MiddleLeft,
-            };
-
-            Color p0Color = new Color(0.85f, 0.2f, 0.2f);
-            Color p1Color = new Color(0.9f, 0.55f, 0f);
-            Color p2Color = new Color(0.25f, 0.55f, 0.85f);
-
-            _p0Style = MakeBadgeStyle(p0Color);
-            _p1Style = MakeBadgeStyle(p1Color);
-            _p2Style = MakeBadgeStyle(p2Color);
-
-            _rowSelectedStyle = new GUIStyle(EditorStyles.label)
-            {
-                normal = { background = MakeTexture(new Color(0.17f, 0.36f, 0.53f, 0.8f)) },
-            };
-            _rowNormalStyle = new GUIStyle(EditorStyles.label);
-        }
-
-        private static GUIStyle MakeBadgeStyle(Color bg)
-        {
-            var style = new GUIStyle(EditorStyles.miniLabel)
-            {
-                alignment  = TextAnchor.MiddleCenter,
-                fontStyle  = FontStyle.Bold,
-                normal     = { background = MakeTexture(bg), textColor = Color.white },
-                padding    = new RectOffset(4, 4, 2, 2),
-                margin     = new RectOffset(2, 2, 2, 2),
-            };
-            return style;
-        }
-
-        private static Texture2D MakeTexture(Color c)
-        {
-            var t = new Texture2D(1, 1);
-            t.SetPixel(0, 0, c);
-            t.Apply();
-            return t;
-        }
-
         // ---------------------------------------------------------------
-        // Tabs
+        // Menu
         // ---------------------------------------------------------------
 
-        private static readonly string[] TabNames =
+        [MenuItem("Tools/Unity Auditor", priority = 1000)]
+        public static void ShowWindow()
         {
-            "All", "Code Logic", "Serialization", "Security", "Performance", "Prefabs", "Assets",
-        };
-
-        private static readonly RuleCategory?[] TabCategories =
-        {
-            null,
-            RuleCategory.CodeLogic,
-            RuleCategory.Serialization,
-            RuleCategory.Security,
-            RuleCategory.Performance,
-            RuleCategory.PrefabIntegrity,
-            RuleCategory.AssetSettings,
-        };
+            var wnd = GetWindow<UnityAuditorWindow>("Unity Auditor");
+            wnd.minSize = new Vector2(700, 500);
+        }
 
         // ---------------------------------------------------------------
         // GUI
@@ -143,13 +105,9 @@ namespace UnityAuditor
             var filtered = GetFilteredFindings();
 
             if (_showDetail && _selectedFinding != null)
-            {
                 DrawSplitView(filtered);
-            }
             else
-            {
                 DrawFindingsList(filtered);
-            }
 
             if (_isScanning)
                 DrawProgressOverlay();
@@ -187,16 +145,10 @@ namespace UnityAuditor
             EditorGUILayout.EndHorizontal();
         }
 
-        private void DrawBadge(string text, GUIStyle style)
-        {
-            GUILayout.Label(text, style, GUILayout.ExpandWidth(false));
-        }
-
         private void DrawToolbar()
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
 
-            // Severity filter
             GUILayout.Label("Severity:", EditorStyles.miniLabel, GUILayout.ExpandWidth(false));
             if (GUILayout.Toggle(_severityFilter == null, "All", EditorStyles.toolbarButton, GUILayout.Width(30)))
                 _severityFilter = null;
@@ -209,7 +161,6 @@ namespace UnityAuditor
 
             GUILayout.Space(10);
 
-            // Search
             GUILayout.Label("🔎", EditorStyles.miniLabel, GUILayout.ExpandWidth(false));
             _searchText = EditorGUILayout.TextField(_searchText, EditorStyles.toolbarSearchField,
                 GUILayout.MinWidth(120), GUILayout.MaxWidth(250));
@@ -251,46 +202,37 @@ namespace UnityAuditor
                 return;
             }
 
-            // Column headers
             EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
-            GUILayout.Label("Sev",      EditorStyles.miniLabel, GUILayout.Width(36));
-            GUILayout.Label("Cat",      EditorStyles.miniLabel, GUILayout.Width(88));
-            GUILayout.Label("Rule",     EditorStyles.miniLabel, GUILayout.Width(52));
-            GUILayout.Label("Title",    EditorStyles.miniLabel, GUILayout.ExpandWidth(true));
-            GUILayout.Label("File",     EditorStyles.miniLabel, GUILayout.Width(200));
-            GUILayout.Label("Line",     EditorStyles.miniLabel, GUILayout.Width(40));
+            GUILayout.Label("Sev",   EditorStyles.miniLabel, GUILayout.Width(36));
+            GUILayout.Label("Cat",   EditorStyles.miniLabel, GUILayout.Width(88));
+            GUILayout.Label("Rule",  EditorStyles.miniLabel, GUILayout.Width(52));
+            GUILayout.Label("Title", EditorStyles.miniLabel, GUILayout.ExpandWidth(true));
+            GUILayout.Label("File",  EditorStyles.miniLabel, GUILayout.Width(200));
+            GUILayout.Label("Line",  EditorStyles.miniLabel, GUILayout.Width(40));
             EditorGUILayout.EndHorizontal();
 
             _scrollPos = EditorGUILayout.BeginScrollView(_scrollPos);
             foreach (var f in findings)
             {
                 bool isSelected = f == _selectedFinding;
-                var rowStyle = isSelected ? _rowSelectedStyle : _rowNormalStyle;
+                var rowStyle    = isSelected ? _rowSelectedStyle : _rowNormalStyle;
 
                 EditorGUILayout.BeginHorizontal(rowStyle);
 
-                // Severity badge
                 DrawSeverityBadge(f.Severity);
-
-                // Category
                 GUILayout.Label(CategoryShort(f.Category), EditorStyles.miniLabel, GUILayout.Width(88));
-
-                // Rule ID
                 GUILayout.Label(f.RuleId, EditorStyles.miniLabel, GUILayout.Width(52));
 
-                // Title (clickable to open detail)
                 if (GUILayout.Button(f.Title, EditorStyles.label, GUILayout.ExpandWidth(true)))
                 {
                     _selectedFinding = f;
                     _showDetail = true;
                 }
 
-                // File (clickable to open in IDE)
                 string shortFile = Path.GetFileName(f.FilePath);
                 if (GUILayout.Button(shortFile, EditorStyles.linkLabel, GUILayout.Width(200)))
                     OpenFileAtLine(f.FilePath, f.Line);
 
-                // Line
                 GUILayout.Label(f.Line > 0 ? f.Line.ToString() : "—",
                     EditorStyles.miniLabel, GUILayout.Width(40));
 
@@ -303,18 +245,14 @@ namespace UnityAuditor
 
         private void DrawSplitView(List<AuditFinding> findings)
         {
-            float splitRatio = 0.55f;
-            float listHeight = position.height * splitRatio;
+            float listHeight = position.height * 0.55f;
 
-            // List pane
             GUILayout.BeginVertical(GUILayout.Height(listHeight));
             DrawFindingsList(findings);
             GUILayout.EndVertical();
 
-            // Splitter
             GUILayout.Box("", GUILayout.ExpandWidth(true), GUILayout.Height(2));
 
-            // Detail pane
             GUILayout.BeginVertical(GUILayout.ExpandHeight(true));
             DrawDetailPanel(_selectedFinding);
             GUILayout.EndVertical();
@@ -355,51 +293,20 @@ namespace UnityAuditor
             EditorGUILayout.EndScrollView();
         }
 
-        private static void DrawDetailField(string label, string value)
-        {
-            EditorGUILayout.BeginHorizontal();
-            GUILayout.Label(label + ":", EditorStyles.boldLabel, GUILayout.Width(48));
-            EditorGUILayout.SelectableLabel(value, GUILayout.ExpandWidth(true), GUILayout.Height(16));
-            EditorGUILayout.EndHorizontal();
-        }
-
-        private void DrawSeverityBadge(Severity sev)
-        {
-            var (style, label) = sev switch
-            {
-                Severity.P0_BlockMerge => (_p0Style, "P0"),
-                Severity.P1_MustFix    => (_p1Style, "P1"),
-                _                      => (_p2Style, "P2"),
-            };
-            GUILayout.Label(label, style ?? EditorStyles.miniLabel, GUILayout.Width(28));
-        }
-
-        private void DrawProgressOverlay()
-        {
-            EditorUtility.DisplayProgressBar("Unity Auditor", _scanStatus, _scanProgress);
-        }
-
-        private static void DrawEmptyState(string msg, MessageType type)
-        {
-            GUILayout.Space(40);
-            EditorGUILayout.HelpBox(msg, type);
-        }
-
         // ---------------------------------------------------------------
         // Scan
         // ---------------------------------------------------------------
 
         private void RunScan()
         {
-            _isScanning  = true;
-            _scanStatus  = "Starting...";
+            _isScanning   = true;
+            _scanStatus   = "Starting...";
             _scanProgress = 0f;
             Repaint();
 
             try
             {
-                string assetsRoot = Application.dataPath;
-                _allFindings = AuditEngine.RunAll(assetsRoot, (status, progress) =>
+                _allFindings = AuditEngine.RunAll(Application.dataPath, (status, progress) =>
                 {
                     _scanStatus   = status;
                     _scanProgress = progress;
@@ -408,8 +315,8 @@ namespace UnityAuditor
             }
             finally
             {
-                _isScanning  = false;
-                _hasScanned  = true;
+                _isScanning   = false;
+                _hasScanned   = true;
                 _lastScanTime = DateTime.Now;
                 EditorUtility.ClearProgressBar();
                 Repaint();
@@ -430,15 +337,12 @@ namespace UnityAuditor
         {
             var results = _allFindings.AsEnumerable();
 
-            // Category tab
             if (TabCategories[_selectedTab] != null)
                 results = results.Where(f => f.Category == TabCategories[_selectedTab]);
 
-            // Severity filter
             if (_severityFilter != null)
                 results = results.Where(f => f.Severity == _severityFilter);
 
-            // Search
             if (!string.IsNullOrEmpty(_searchText))
             {
                 var q = _searchText.ToLowerInvariant();
@@ -464,8 +368,8 @@ namespace UnityAuditor
             sb.AppendLine();
 
             var sevCounts = AuditEngine.GetSeverityCounts(_allFindings);
-            sb.AppendLine($"| Severity | Count |");
-            sb.AppendLine($"|----------|-------|");
+            sb.AppendLine("| Severity | Count |");
+            sb.AppendLine("|----------|-------|");
             sb.AppendLine($"| P0 Block Merge | {sevCounts[Severity.P0_BlockMerge]} |");
             sb.AppendLine($"| P1 Must Fix    | {sevCounts[Severity.P1_MustFix]} |");
             sb.AppendLine($"| P2 Suggestion  | {sevCounts[Severity.P2_Suggestion]} |");
@@ -475,24 +379,99 @@ namespace UnityAuditor
             sb.AppendLine("|-----|----------|------|-------|------|------|");
 
             foreach (var f in _allFindings)
-            {
                 sb.AppendLine($"| {f.Severity} | {f.Category} | {f.RuleId} | {f.Title} | {Path.GetFileName(f.FilePath)} | {f.Line} |");
-            }
 
             EditorGUIUtility.systemCopyBuffer = sb.ToString();
             Debug.Log("[UnityAuditor] Report copied to clipboard.");
         }
 
+        // ---------------------------------------------------------------
+        // Helpers
+        // ---------------------------------------------------------------
+
+        private void InitStyles()
+        {
+            if (_stylesInitialized) return;
+            _stylesInitialized = true;
+
+            _headerStyle = new GUIStyle(EditorStyles.boldLabel)
+            {
+                fontSize  = 13,
+                alignment = TextAnchor.MiddleLeft,
+            };
+
+            var p0Color = new Color(0.85f, 0.2f, 0.2f);
+            var p1Color = new Color(0.9f, 0.55f, 0f);
+            var p2Color = new Color(0.25f, 0.55f, 0.85f);
+
+            _p0Style = MakeBadgeStyle(p0Color);
+            _p1Style = MakeBadgeStyle(p1Color);
+            _p2Style = MakeBadgeStyle(p2Color);
+
+            _rowSelectedStyle = new GUIStyle(EditorStyles.label)
+            {
+                normal = { background = MakeTexture(new Color(0.17f, 0.36f, 0.53f, 0.8f)) },
+            };
+            _rowNormalStyle = new GUIStyle(EditorStyles.label);
+        }
+
+        private static GUIStyle MakeBadgeStyle(Color bg) => new GUIStyle(EditorStyles.miniLabel)
+        {
+            alignment = TextAnchor.MiddleCenter,
+            fontStyle = FontStyle.Bold,
+            normal    = { background = MakeTexture(bg), textColor = Color.white },
+            padding   = new RectOffset(4, 4, 2, 2),
+            margin    = new RectOffset(2, 2, 2, 2),
+        };
+
+        private static Texture2D MakeTexture(Color c)
+        {
+            var t = new Texture2D(1, 1);
+            t.SetPixel(0, 0, c);
+            t.Apply();
+            return t;
+        }
+
+        private static void DrawBadge(string text, GUIStyle style) =>
+            GUILayout.Label(text, style, GUILayout.ExpandWidth(false));
+
+        private void DrawSeverityBadge(Severity sev)
+        {
+            var (style, label) = sev switch
+            {
+                Severity.P0_BlockMerge => (_p0Style, "P0"),
+                Severity.P1_MustFix   => (_p1Style, "P1"),
+                _                     => (_p2Style, "P2"),
+            };
+            GUILayout.Label(label, style ?? EditorStyles.miniLabel, GUILayout.Width(28));
+        }
+
+        private static void DrawDetailField(string label, string value)
+        {
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.Label(label + ":", EditorStyles.boldLabel, GUILayout.Width(48));
+            EditorGUILayout.SelectableLabel(value, GUILayout.ExpandWidth(true), GUILayout.Height(16));
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private static void DrawProgressOverlay() =>
+            EditorUtility.DisplayProgressBar("Unity Auditor", "", 0f);
+
+        private static void DrawEmptyState(string msg, MessageType type)
+        {
+            GUILayout.Space(40);
+            EditorGUILayout.HelpBox(msg, type);
+        }
+
         private static void OpenFileAtLine(string relativePath, int line)
         {
-            // relativePath is relative to Assets/ — construct full path
             string fullPath = Path.Combine(
                 Application.dataPath.Replace("/Assets", ""),
                 "Assets",
                 relativePath.TrimStart('/', '\\'));
 
             if (!File.Exists(fullPath))
-                fullPath = relativePath; // try as-is (already absolute or asset path)
+                fullPath = relativePath;
 
             var asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(
                 "Assets/" + relativePath.TrimStart('/', '\\'));
@@ -503,19 +482,18 @@ namespace UnityAuditor
                 EditorUtility.OpenWithDefaultApp(fullPath);
         }
 
-        // ---------------------------------------------------------------
-        // Helpers
-        // ---------------------------------------------------------------
-
         private static string CategoryShort(RuleCategory cat) => cat switch
         {
-            RuleCategory.CodeLogic      => "Code Logic",
-            RuleCategory.Serialization  => "Serialize",
-            RuleCategory.Security       => "Security",
-            RuleCategory.Performance    => "Perf",
+            RuleCategory.CodeLogic       => "Code Logic",
+            RuleCategory.Serialization   => "Serialize",
+            RuleCategory.Security        => "Security",
+            RuleCategory.Performance     => "Perf",
             RuleCategory.PrefabIntegrity => "Prefab",
-            RuleCategory.AssetSettings  => "Assets",
-            _                           => cat.ToString(),
+            RuleCategory.AssetSettings   => "Assets",
+            RuleCategory.Lifecycle       => "Lifecycle",
+            RuleCategory.Architecture    => "Arch",
+            RuleCategory.Optimization    => "Optim",
+            _                            => cat.ToString(),
         };
     }
 }

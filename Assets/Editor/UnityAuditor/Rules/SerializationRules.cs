@@ -1,23 +1,16 @@
-using System.Collections.Generic;
-using System.IO;
-using System.Text.RegularExpressions;
-
+#if UNITY_EDITOR
 namespace UnityAuditor.Rules
 {
     /// <summary>
-    /// Scans C# source files for Unity serialization pitfalls:
-    ///   - Public fields without [SerializeField] (accidental exposure)
-    ///   - [System.Serializable] structs with properties (not serialized by Unity)
-    ///   - SerializeReference on interface/abstract without concrete type
-    ///   - Non-serializable types in serialized fields (Dictionary, HashSet)
-    ///   - [NonSerialized] on private fields (redundant but confusing)
-    ///   - BinaryFormatter usage (deprecated, security risk)
+    /// P0/P1/P2 serialization rules: Dictionary in SerializeField, BinaryFormatter,
+    /// auto-property on Serializable class, public field hygiene, SerializeReference misuse,
+    /// OnValidate without Undo.
     /// </summary>
-    public class SerializationRules : IAuditRule
+    public sealed class SerializationRules : RegexRuleBase
     {
-        public RuleCategory Category => RuleCategory.Serialization;
+        public override RuleCategory Category => RuleCategory.Serialization;
 
-        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules =
+        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] _rules =
         {
             (
                 "SR001",
@@ -76,52 +69,58 @@ namespace UnityAuditor.Rules
                 "will bypass the Undo system and can cause data loss.",
                 "Guard modifications: `UnityEditor.Undo.RecordObject(this, \"Validate\");` before field changes in OnValidate."
             ),
+            (
+                "SR007",
+                "[NonSerialized] on a private field — redundant",
+                @"\[NonSerialized\]\s*private\s+",
+                Severity.P2_Suggestion,
+                "Private fields without [SerializeField] are already non-serialized by Unity. Adding [NonSerialized] " +
+                "is redundant and indicates confusion about Unity serialization rules.",
+                "Remove the [NonSerialized] attribute. Private fields are not serialized unless marked with [SerializeField]."
+            ),
+            (
+                "SR008",
+                "Public mutable List/array on ScriptableObject without [HideInInspector]",
+                @"(?:ScriptableObject)[^}]*public\s+(?:List\s*<|[\w]+\s*\[\])\s*\w+",
+                Severity.P1_MustFix,
+                "ScriptableObject instances are shared assets. A public mutable collection exposed in the Inspector " +
+                "can be accidentally modified in one prefab and silently affect all references.",
+                "Use [HideInInspector] or make the field private with [SerializeField]. Consider exposing a " +
+                "read-only IReadOnlyList<T> property instead."
+            ),
+            (
+                "SR009",
+                "Enum without explicit integer values",
+                @"enum\s+\w+\s*\{[^}=]+\}",
+                Severity.P2_Suggestion,
+                "Enums without explicit integer values will have their serialized meaning change silently if members " +
+                "are added, removed, or reordered. All serialized references become corrupted.",
+                "Assign explicit values: enum MyEnum { None = 0, TypeA = 1, TypeB = 2 }. This ensures serialized " +
+                "data remains stable across code changes."
+            ),
+            (
+                "SR010",
+                "[SerializeField] array or List with large default initializer (>100 elements)",
+                @"\[SerializeField\][^;]*(?:new\s+\w+\s*\[\s*\d{3,}\s*\]|new\s+List\s*<[^>]+>\s*\(\s*\d{3,}\s*\))",
+                Severity.P2_Suggestion,
+                "Large serialized collections bloat .prefab and .scene YAML files, slow down Inspector rendering, " +
+                "and increase version control diff noise.",
+                "Reduce default size or populate at runtime. For large data sets, use ScriptableObject assets " +
+                "or Addressables instead of inline serialized arrays."
+            ),
+            (
+                "SR011",
+                "[System.Serializable] class — verify parameterless constructor exists",
+                @"\[System\.Serializable\]\s*(?:public\s+|internal\s+)?(?:sealed\s+)?class\s+\w+",
+                Severity.P1_MustFix,
+                "Unity serialization requires a parameterless constructor. Without one, deserialization silently " +
+                "fails — the object is created with default values, losing all serialized data.",
+                "Add an explicit parameterless constructor: public MyClass() { }. Unity calls this during " +
+                "deserialization to create the instance before populating fields."
+            ),
         };
 
-        public List<AuditFinding> Scan(string assetsRoot)
-        {
-            var findings = new List<AuditFinding>();
-            foreach (var csFile in Directory.GetFiles(assetsRoot, "*.cs", SearchOption.AllDirectories))
-            {
-                if (csFile.Contains("Generated") || csFile.Contains(".Designer.")) continue;
-
-                var fullText = File.ReadAllText(csFile);
-                var relativePath = MakeRelative(csFile, assetsRoot);
-
-                foreach (var rule in Rules)
-                {
-                    var matches = Regex.Matches(fullText, rule.pattern,
-                        RegexOptions.Singleline | RegexOptions.IgnoreCase);
-
-                    foreach (Match match in matches)
-                    {
-                        findings.Add(new AuditFinding
-                        {
-                            Severity     = rule.sev,
-                            Category     = RuleCategory.Serialization,
-                            RuleId       = rule.id,
-                            Title        = rule.title,
-                            FilePath     = relativePath,
-                            Line         = CountLines(fullText, match.Index),
-                            Detail       = match.Value.Trim(),
-                            WhyItMatters = rule.why,
-                            HowToFix     = rule.fix,
-                        });
-                    }
-                }
-            }
-            return findings;
-        }
-
-        private static int CountLines(string text, int charIndex)
-        {
-            int line = 1;
-            for (int i = 0; i < charIndex && i < text.Length; i++)
-                if (text[i] == '\n') line++;
-            return line;
-        }
-
-        private static string MakeRelative(string fullPath, string root) =>
-            fullPath.StartsWith(root) ? fullPath.Substring(root.Length).TrimStart('/', '\\') : fullPath;
+        protected override (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules => _rules;
     }
 }
+#endif

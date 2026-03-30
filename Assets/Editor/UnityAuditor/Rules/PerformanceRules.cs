@@ -1,28 +1,15 @@
-using System.Collections.Generic;
-using System.IO;
-using System.Text.RegularExpressions;
-
+#if UNITY_EDITOR
 namespace UnityAuditor.Rules
 {
     /// <summary>
-    /// Scans C# source files for Unity performance anti-patterns:
-    ///   - String concatenation in hot paths (GC pressure)
-    ///   - new() allocations in Update/FixedUpdate/LateUpdate
-    ///   - LINQ usage in hot paths
-    ///   - Object.FindObjectOfType in Update (already in CodeLogic but P0 here)
-    ///   - transform.position read in tight loops without caching
-    ///   - SendMessage / BroadcastMessage usage
-    ///   - Debug.Log in non-editor builds
+    /// P1/P2 performance rules: string concat in Update, new() allocations in hot paths,
+    /// LINQ in Update, SendMessage, unguarded Debug.Log, tag string comparison, RaycastHit in loops.
     /// </summary>
-    public class PerformanceRules : IAuditRule
+    public sealed class PerformanceRules : RegexRuleBase
     {
-        public RuleCategory Category => RuleCategory.Performance;
+        public override RuleCategory Category => RuleCategory.Performance;
 
-        // Hot-path method names for context-aware matching
-        private const string HotPathPattern =
-            @"void\s+(Update|FixedUpdate|LateUpdate|OnTriggerStay|OnCollisionStay)\s*\([^)]*\)\s*\{(?:[^{}]|\{[^{}]*\})*";
-
-        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules =
+        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] _rules =
         {
             (
                 "PERF001",
@@ -91,52 +78,38 @@ namespace UnityAuditor.Rules
                 "Declaring RaycastHit inside a loop re-initializes the struct each iteration.",
                 "Declare RaycastHit as a field or outside the loop scope to reuse the stack allocation."
             ),
+            (
+                "PERF008",
+                "new WaitForSeconds() inside a coroutine loop — allocates every iteration",
+                @"(while|for)\s*\([^)]*\)\s*\{[^}]*yield\s+return\s+new\s+WaitForSeconds",
+                Severity.P1_MustFix,
+                "Creating new WaitForSeconds inside a loop allocates a new object every iteration. " +
+                "At typical coroutine frequencies this generates hundreds of GC objects per minute.",
+                "Cache the WaitForSeconds: `private WaitForSeconds _wait = new WaitForSeconds(1f);` " +
+                "then `yield return _wait;` inside the loop."
+            ),
+            (
+                "PERF009",
+                "Resources.Load called inside Update/FixedUpdate/LateUpdate",
+                @"(void\s+(?:Update|FixedUpdate|LateUpdate))[^}]*Resources\.Load\s*[<(]",
+                Severity.P1_MustFix,
+                "Resources.Load is a synchronous disk read. Calling it every frame causes massive " +
+                "frame spikes and disk thrashing.",
+                "Load resources in Awake/Start and cache the reference. Use Addressables for async loading."
+            ),
+            (
+                "PERF010",
+                "Manual Camera.Render() or Camera.RenderWithShader() call",
+                @"Camera\.\s*(?:Render|RenderWithShader)\s*\(",
+                Severity.P2_Suggestion,
+                "Manual camera rendering is extremely expensive. It's often called unintentionally " +
+                "or redundantly alongside Unity's automatic rendering pipeline.",
+                "Verify this manual render call is intentional. Consider using RenderTextures with " +
+                "Camera.targetTexture instead for off-screen rendering."
+            ),
         };
 
-        public List<AuditFinding> Scan(string assetsRoot)
-        {
-            var findings = new List<AuditFinding>();
-            foreach (var csFile in Directory.GetFiles(assetsRoot, "*.cs", SearchOption.AllDirectories))
-            {
-                if (csFile.Contains("Generated") || csFile.Contains(".Designer.")) continue;
-
-                var fullText = File.ReadAllText(csFile);
-                var relativePath = MakeRelative(csFile, assetsRoot);
-
-                foreach (var rule in Rules)
-                {
-                    var matches = Regex.Matches(fullText, rule.pattern,
-                        RegexOptions.Singleline | RegexOptions.IgnoreCase);
-
-                    foreach (Match match in matches)
-                    {
-                        findings.Add(new AuditFinding
-                        {
-                            Severity     = rule.sev,
-                            Category     = RuleCategory.Performance,
-                            RuleId       = rule.id,
-                            Title        = rule.title,
-                            FilePath     = relativePath,
-                            Line         = CountLines(fullText, match.Index),
-                            Detail       = match.Value.Trim(),
-                            WhyItMatters = rule.why,
-                            HowToFix     = rule.fix,
-                        });
-                    }
-                }
-            }
-            return findings;
-        }
-
-        private static int CountLines(string text, int charIndex)
-        {
-            int line = 1;
-            for (int i = 0; i < charIndex && i < text.Length; i++)
-                if (text[i] == '\n') line++;
-            return line;
-        }
-
-        private static string MakeRelative(string fullPath, string root) =>
-            fullPath.StartsWith(root) ? fullPath.Substring(root.Length).TrimStart('/', '\\') : fullPath;
+        protected override (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules => _rules;
     }
 }
+#endif

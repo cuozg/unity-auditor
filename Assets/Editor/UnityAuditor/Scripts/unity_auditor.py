@@ -38,6 +38,19 @@ from typing import Callable, Iterator, Optional
 
 
 # ---------------------------------------------------------------------------
+# Note on C#/Python rule parity
+# ---------------------------------------------------------------------------
+# The following C# rules require Unity AssetDatabase and CANNOT run headlessly:
+#   AS001-AS013 (AssetSettings: texture/mesh/audio/animation/shader/material/atlas/video/font)
+#   PF002 (Broken prefab variant base)
+#   PF003-PF011 (Prefab: Canvas/collider/nesting/EventSystem/Animator/trigger/UI/particles/duplicates)
+# Only PF001 and PF003 have YAML heuristic equivalents in this script.
+# All regex-based rules (CodeLogic, Security, Serialization, Performance,
+# Lifecycle, Architecture, Optimization) are fully mirrored.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -51,6 +64,9 @@ CATEGORY_SEC = "Security"
 CATEGORY_PERF = "Performance"
 CATEGORY_PREFAB = "PrefabIntegrity"
 CATEGORY_ASSET = "AssetSettings"
+CATEGORY_LIFE = "Lifecycle"
+CATEGORY_ARCH = "Architecture"
+CATEGORY_OPT = "Optimization"
 
 
 @dataclass
@@ -67,15 +83,71 @@ class Finding:
 
 
 # ---------------------------------------------------------------------------
+# Suppression support
+# ---------------------------------------------------------------------------
+
+IGNORE_PREFIX = "UnityAuditor:ignore "
+IGNORE_NEXT_LINE_PREFIX = "UnityAuditor:ignore-next-line "
+
+
+def _is_suppressed(lines: list, line_number: int, rule_id: str) -> bool:
+    """Check if a finding at line_number (1-based) is suppressed."""
+    if line_number < 1 or line_number > len(lines):
+        return False
+
+    current_line = lines[line_number - 1]
+
+    # Same-line: // UnityAuditor:ignore RULEID
+    idx = current_line.find(IGNORE_PREFIX)
+    if idx >= 0:
+        # Make sure it's not the longer "ignore-next-line" variant
+        next_idx = current_line.find(IGNORE_NEXT_LINE_PREFIX)
+        if next_idx < 0 or next_idx != idx:
+            rest = current_line[idx + len(IGNORE_PREFIX) :].strip()
+            if rest.startswith(rule_id) and (
+                len(rest) == len(rule_id) or rest[len(rule_id)] in (" ", "\t", "\n")
+            ):
+                return True
+
+    # Previous line: // UnityAuditor:ignore-next-line RULEID
+    if line_number >= 2:
+        prev_line = lines[line_number - 2]
+        idx = prev_line.find(IGNORE_NEXT_LINE_PREFIX)
+        if idx >= 0:
+            rest = prev_line[idx + len(IGNORE_NEXT_LINE_PREFIX) :].strip()
+            if rest.startswith(rule_id) and (
+                len(rest) == len(rule_id) or rest[len(rule_id)] in (" ", "\t", "\n")
+            ):
+                return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Base rule helpers
 # ---------------------------------------------------------------------------
 
 
-def _scan_cs_files(assets_root: str) -> Iterator[tuple[str, str, list[str]]]:
+def _scan_cs_files(assets_root: str) -> Iterator:
     """Yield (file_path, full_text, lines) for every .cs file."""
     for root, dirs, files in os.walk(assets_root):
         # Skip generated / editor-only dirs
         dirs[:] = [d for d in dirs if d not in ("Generated", "Editor")]
+        for f in files:
+            if f.endswith(".cs"):
+                full = os.path.join(root, f)
+                try:
+                    text = Path(full).read_text(encoding="utf-8", errors="replace")
+                    yield full, text, text.splitlines()
+                except OSError:
+                    pass
+
+
+def _scan_cs_files_with_editor(assets_root: str) -> Iterator:
+    """Yield (file_path, full_text, lines) for every .cs file INCLUDING Editor/."""
+    for root, dirs, files in os.walk(assets_root):
+        # Skip Generated dirs only — include Editor/ for Architecture rules
+        dirs[:] = [d for d in dirs if d != "Generated"]
         for f in files:
             if f.endswith(".cs"):
                 full = os.path.join(root, f)
@@ -100,17 +172,23 @@ def _line_of(text: str, char_idx: int) -> int:
 def _regex_scan(
     assets_root: str,
     category: str,
-    rules: list[tuple],
-    extra_filter: Optional[Callable[[str], bool]] = None,
-) -> list[Finding]:
-    findings: list[Finding] = []
-    for file_path, text, _ in _scan_cs_files(assets_root):
+    rules: list,
+    extra_filter: Optional[Callable] = None,
+    include_editor: bool = False,
+) -> list:
+    findings = []
+    scanner = _scan_cs_files_with_editor if include_editor else _scan_cs_files
+    for file_path, text, lines in scanner(assets_root):
         if extra_filter and extra_filter(file_path):
             continue
         rel = _rel(file_path, assets_root)
+        has_suppression = "UnityAuditor:ignore" in text  # Fast check
         for rule_id, title, pattern, severity, why, fix in rules:
             try:
                 for m in re.finditer(pattern, text, re.IGNORECASE | re.DOTALL):
+                    line_num = _line_of(text, m.start())
+                    if has_suppression and _is_suppressed(lines, line_num, rule_id):
+                        continue
                     findings.append(
                         Finding(
                             severity=severity,
@@ -118,7 +196,7 @@ def _regex_scan(
                             rule_id=rule_id,
                             title=title,
                             file_path=rel,
-                            line=_line_of(text, m.start()),
+                            line=line_num,
                             detail=m.group(0)[:120].strip(),
                             why=why,
                             how_to_fix=fix,
@@ -176,16 +254,49 @@ CODE_RULES = [
     ),
     (
         "CL006",
-        "SendMessage / BroadcastMessage usage",
-        r"\b(?:SendMessage|BroadcastMessage|SendMessageUpwards)\s*\(",
+        "StartCoroutine without null/active guard",
+        r"StartCoroutine\s*\(",
+        SEVERITY_P2,
+        "StartCoroutine on a disabled or destroyed GameObject throws MissingReferenceException.",
+        "Guard with: if (this != null && gameObject.activeInHierarchy) StartCoroutine(...);",
+    ),
+    (
+        "CL007",
+        "Destroy called without null check",
+        r"Destroy\s*\(\s*\w+\s*\)",
+        SEVERITY_P2,
+        "Calling Destroy(null) is safe, but Destroy on an already-destroyed object logs a warning.",
+        "Use if (obj != null) Destroy(obj); for clarity and to suppress spurious warnings.",
+    ),
+    # --- New from Goal 2 ---
+    (
+        "CL008",
+        "Coroutine method (IEnumerator) without any yield return",
+        r"IEnumerator\s+\w+\s*\([^)]*\)\s*\{(?:(?!yield\s+return)[^}])*\}",
         SEVERITY_P1,
-        "SendMessage uses reflection — ~10x slower than a direct call, triggers GC.",
-        "Replace with direct calls, C# events, or ScriptableObject event channels.",
+        "An IEnumerator method without yield executes entirely in one frame — defeating the purpose of coroutines.",
+        "Add yield return statements or change the return type to void if coroutine behavior is not needed.",
+    ),
+    (
+        "CL009",
+        "async void method declaration (should be async Task)",
+        r"async\s+void\s+\w+\s*\(",
+        SEVERITY_P1,
+        "async void methods swallow exceptions silently and cannot be awaited.",
+        "Change to 'async Task MethodName()' and await the result.",
+    ),
+    (
+        "CL010",
+        "UnityEvent.Invoke() called without listener/null guard",
+        r"\.Invoke\s*\(\s*\)",
+        SEVERITY_P2,
+        "Invoking a UnityEvent with zero persistent listeners is a no-op — may indicate misconfigured wiring.",
+        "Check GetPersistentEventCount() > 0 before invoking.",
     ),
 ]
 
 
-def run_code_logic(assets_root: str) -> list[Finding]:
+def run_code_logic(assets_root: str) -> list:
     return _regex_scan(assets_root, CATEGORY_CODE, CODE_RULES)
 
 
@@ -226,10 +337,67 @@ SERIAL_RULES = [
         "BinaryFormatter is deprecated and has deserialization RCE vulnerabilities.",
         "Replace with JsonUtility, Newtonsoft.Json, or a proper binary format.",
     ),
+    (
+        "SR005",
+        "[SerializeReference] field with concrete sealed type",
+        r"\[SerializeReference\][^;]*\b(?:int|float|bool|string|Vector2|Vector3|Quaternion)\b",
+        SEVERITY_P2,
+        "[SerializeReference] is for polymorphic references — overhead with no benefit on value/sealed types.",
+        "Use [SerializeField] for value types and concrete sealed types.",
+    ),
+    (
+        "SR006",
+        "OnValidate modifying serialized data without Undo",
+        r"void\s+OnValidate\s*\(\s*\)[^}]*=\s*[^;]+;",
+        SEVERITY_P1,
+        "OnValidate runs on every Editor change. Modifying fields without Undo.RecordObject causes data loss.",
+        'Guard: UnityEditor.Undo.RecordObject(this, "Validate"); before field changes.',
+    ),
+    # --- New from Goal 4 ---
+    (
+        "SR007",
+        "[NonSerialized] on a private field — redundant",
+        r"\[NonSerialized\]\s*private\s+",
+        SEVERITY_P2,
+        "Private fields without [SerializeField] are already non-serialized.",
+        "Remove the [NonSerialized] attribute.",
+    ),
+    (
+        "SR008",
+        "Public mutable List/array on ScriptableObject",
+        r"(?:ScriptableObject)[^}]*public\s+(?:List\s*<|[\w]+\s*\[\])\s*\w+",
+        SEVERITY_P1,
+        "ScriptableObject instances are shared. Public mutable collections can be accidentally modified.",
+        "Use [HideInInspector] or make private with [SerializeField].",
+    ),
+    (
+        "SR009",
+        "Enum without explicit integer values",
+        r"enum\s+\w+\s*\{[^}=]+\}",
+        SEVERITY_P2,
+        "Enums without explicit values will silently corrupt serialized references if members change.",
+        "Assign explicit values: enum MyEnum { None = 0, TypeA = 1, TypeB = 2 }.",
+    ),
+    (
+        "SR010",
+        "[SerializeField] with large default initializer (>100 elements)",
+        r"\[SerializeField\][^;]*(?:new\s+\w+\s*\[\s*\d{3,}\s*\]|new\s+List\s*<[^>]+>\s*\(\s*\d{3,}\s*\))",
+        SEVERITY_P2,
+        "Large serialized collections bloat YAML files and slow Inspector.",
+        "Reduce default size or populate at runtime.",
+    ),
+    (
+        "SR011",
+        "[System.Serializable] class — verify parameterless constructor",
+        r"\[System\.Serializable\]\s*(?:public\s+|internal\s+)?(?:sealed\s+)?class\s+\w+",
+        SEVERITY_P1,
+        "Unity serialization requires parameterless constructor. Missing causes silent data loss.",
+        "Add: public MyClass() { }",
+    ),
 ]
 
 
-def run_serialization(assets_root: str) -> list[Finding]:
+def run_serialization(assets_root: str) -> list:
     return _regex_scan(assets_root, CATEGORY_SERIAL, SERIAL_RULES)
 
 
@@ -286,10 +454,35 @@ SEC_RULES = [
         "Plain HTTP transmits data unencrypted, including auth tokens.",
         "Use HTTPS for all production endpoints.",
     ),
+    # --- New from Goal 5 ---
+    (
+        "SEC007",
+        "Unsafe JSON deserialization with TypeNameHandling",
+        r"TypeNameHandling\s*\.\s*(?:All|Auto|Objects)",
+        SEVERITY_P0,
+        "TypeNameHandling.All/Auto/Objects enables type confusion RCE attacks.",
+        "Use TypeNameHandling.None. For polymorphic deserialization, use custom SerializationBinder.",
+    ),
+    (
+        "SEC008",
+        "File read with variable path — path traversal risk",
+        r"(?:File\.ReadAllText|File\.ReadAllBytes|StreamReader)\s*\(\s*[a-zA-Z_]\w*",
+        SEVERITY_P0,
+        "File read with variable paths vulnerable to path traversal (../../etc/passwd).",
+        "Validate paths against allowlist. Use Path.GetFullPath() and verify base directory.",
+    ),
+    (
+        "SEC009",
+        "Process.Start with non-literal arguments — command injection",
+        r"Process\.Start\s*\(\s*[a-zA-Z_]\w*",
+        SEVERITY_P0,
+        "Process.Start with variable arguments enables command injection.",
+        "Use ProcessStartInfo with hardcoded executable. Validate all arguments.",
+    ),
 ]
 
 
-def run_security(assets_root: str) -> list[Finding]:
+def run_security(assets_root: str) -> list:
     return _regex_scan(assets_root, CATEGORY_SEC, SEC_RULES)
 
 
@@ -309,7 +502,7 @@ PERF_RULES = [
     (
         "PERF002",
         "new() allocation inside Update/FixedUpdate/LateUpdate",
-        r"(?:void\s+(?:Update|FixedUpdate|LateUpdate)[^{]*\{[^}]*)\bnew\s+(?!List|Dictionary|HashSet)\w+\s*[(<]",
+        r"(?:void\s+(?:Update|FixedUpdate|LateUpdate)[^{]*\{[^}]*)\bnew\s+(?!List|Dictionary|HashSet|Queue|Stack|Array)\w+\s*[(<]",
         SEVERITY_P1,
         "Object allocation in a hot path forces GC collection.",
         "Cache reusable objects as fields. Use object pools.",
@@ -317,7 +510,7 @@ PERF_RULES = [
     (
         "PERF003",
         "LINQ in Update hot path",
-        r"(?:void\s+(?:Update|FixedUpdate|LateUpdate)[^{]*\{[^}]*)(?:\.Where\(|\.Select\(|\.FirstOrDefault\(|\.Any\(|\.ToList\(|\.ToArray\()",
+        r"(?:void\s+(?:Update|FixedUpdate|LateUpdate)[^{]*\{[^}]*)(?:\.Where\(|\.Select\(|\.FirstOrDefault\(|\.Any\(|\.OrderBy\(|\.ToList\(|\.ToArray\()",
         SEVERITY_P1,
         "LINQ allocates IEnumerator objects and intermediate collections on the heap.",
         "Pre-compute and cache LINQ results. Use manual for loops in hot paths.",
@@ -332,17 +525,252 @@ PERF_RULES = [
     ),
     (
         "PERF005",
-        "tag comparison with string literal",
-        r"\.tag\s*==\s*\"",
+        "Debug.Log called outside #if UNITY_EDITOR guard",
+        r"(?<!\#if\s+UNITY_EDITOR[^\n]*\n[^\n]*)Debug\.(?:Log|LogWarning|LogError|LogFormat)\s*\(",
+        SEVERITY_P2,
+        "Debug.Log has significant overhead in release builds: string formatting, stack trace capture.",
+        "Wrap all debug logging in #if UNITY_EDITOR or #if DEVELOPMENT_BUILD.",
+    ),
+    (
+        "PERF006",
+        "transform.tag comparison with string",
+        r'\.tag\s*==\s*"',
         SEVERITY_P2,
         'gameObject.tag == "string" allocates a new string each comparison.',
-        'Use gameObject.CompareTag("TagName") — it\'s allocation-free.',
+        'Use gameObject.CompareTag("TagName") — allocation-free and faster.',
+    ),
+    (
+        "PERF007",
+        "RaycastHit allocated inside a loop",
+        r"(?:for|while|foreach)[^{]*\{[^}]*RaycastHit\s+\w+\s*=\s*new\s+RaycastHit",
+        SEVERITY_P2,
+        "Declaring RaycastHit inside a loop re-initializes the struct each iteration.",
+        "Declare RaycastHit as a field or outside the loop scope.",
+    ),
+    # --- New from Goal 3 ---
+    (
+        "PERF008",
+        "new WaitForSeconds() inside a coroutine loop",
+        r"(?:while|for)\s*\([^)]*\)\s*\{[^}]*yield\s+return\s+new\s+WaitForSeconds",
+        SEVERITY_P1,
+        "Creating new WaitForSeconds inside a loop allocates a new object every iteration.",
+        "Cache: private WaitForSeconds _wait = new WaitForSeconds(1f); yield return _wait;",
+    ),
+    (
+        "PERF009",
+        "Resources.Load called inside Update/FixedUpdate/LateUpdate",
+        r"(?:void\s+(?:Update|FixedUpdate|LateUpdate))[^}]*Resources\.Load\s*[<(]",
+        SEVERITY_P1,
+        "Resources.Load is a synchronous disk read. Calling it every frame causes frame spikes.",
+        "Load resources in Awake/Start and cache. Use Addressables for async loading.",
+    ),
+    (
+        "PERF010",
+        "Manual Camera.Render() or Camera.RenderWithShader() call",
+        r"Camera\.\s*(?:Render|RenderWithShader)\s*\(",
+        SEVERITY_P2,
+        "Manual camera rendering is extremely expensive and often unintentional.",
+        "Verify this manual render call is intentional. Consider RenderTextures instead.",
     ),
 ]
 
 
-def run_performance(assets_root: str) -> list[Finding]:
+def run_performance(assets_root: str) -> list:
     return _regex_scan(assets_root, CATEGORY_PERF, PERF_RULES)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle Rules  (mirrors LifecycleRules.cs)
+# ---------------------------------------------------------------------------
+
+LIFECYCLE_RULES = [
+    (
+        "LC001",
+        "Virtual method call in Awake() or constructor",
+        r"(?:void\s+Awake|(?:public|private|protected|internal)\s+\w+\s*\(\s*\))\s*\{[^}]*(?:virtual|base\.)\w+",
+        SEVERITY_P1,
+        "Calling virtual methods in Awake/constructor runs base implementation — derived class not initialized.",
+        "Move virtual/overridden calls to Start().",
+    ),
+    (
+        "LC002",
+        "GetComponent/Find* targeting other GameObjects in Awake()",
+        r"void\s+Awake\s*\(\s*\)[^}]*(?:GetComponentInParent|GetComponentInChildren|FindObjectOfType|GameObject\.Find)\s*[<(]",
+        SEVERITY_P1,
+        "In Awake(), sibling initialization order is undefined. Cross-GO GetComponent may return uninitialized.",
+        "Move cross-GameObject GetComponent/Find calls to Start().",
+    ),
+    (
+        "LC003",
+        "DontDestroyOnLoad called on a child GameObject",
+        r"DontDestroyOnLoad\s*\(\s*(?!gameObject|this\.gameObject)\w+",
+        SEVERITY_P1,
+        "DontDestroyOnLoad only works on root GameObjects. Children get destroyed with parent's scene.",
+        "Call on root: DontDestroyOnLoad(transform.root.gameObject);",
+    ),
+    (
+        "LC004",
+        "OnDestroy accessing components without null-check",
+        r"void\s+OnDestroy\s*\(\s*\)[^}]*(?:GetComponent|\.transform|\.gameObject)\s*[<.(]",
+        SEVERITY_P2,
+        "During teardown, referenced components may already be destroyed.",
+        "Null-check all references in OnDestroy.",
+    ),
+    (
+        "LC005",
+        "Time.deltaTime used inside FixedUpdate",
+        r"void\s+FixedUpdate\s*\(\s*\)[^}]*Time\.deltaTime",
+        SEVERITY_P1,
+        "FixedUpdate uses fixed timestep. Use Time.fixedDeltaTime for clarity and correctness.",
+        "Replace Time.deltaTime with Time.fixedDeltaTime.",
+    ),
+    (
+        "LC006",
+        "DefaultExecutionOrder attribute usage",
+        r"\[DefaultExecutionOrder\s*\(\s*(?:-?\d+)\s*\)\]",
+        SEVERITY_P2,
+        "Duplicate order values defeat explicit ordering — relative order remains undefined.",
+        "Assign unique values. This rule flags all usages for manual review.",
+    ),
+]
+
+
+def run_lifecycle(assets_root: str) -> list:
+    return _regex_scan(assets_root, CATEGORY_LIFE, LIFECYCLE_RULES)
+
+
+# ---------------------------------------------------------------------------
+# Architecture Rules  (mirrors ArchitectureRules.cs)
+# ---------------------------------------------------------------------------
+
+ARCHITECTURE_RULES = [
+    (
+        "AR001",
+        "MonoBehaviour/ScriptableObject class body exceeds ~500 lines",
+        r"(?s)class\s+\w+\s*:\s*(?:MonoBehaviour|ScriptableObject)[^{]*\{(.{15000,})",
+        SEVERITY_P2,
+        "Classes >500 lines are hard to maintain. Often multiple responsibilities.",
+        "Extract into separate components. Follow Single Responsibility Principle.",
+    ),
+    (
+        "AR002",
+        "Class has many public methods (potential god class)",
+        r"(?:public\s+(?:virtual\s+|override\s+|static\s+)?(?:void|bool|int|float|string|[\w<>\[\]]+)\s+\w+\s*\([^)]*\)\s*\{[^}]*\}.*?){10,}",
+        SEVERITY_P2,
+        "Many public methods = too many responsibilities (god class anti-pattern).",
+        "Apply Interface Segregation. Split into focused interfaces.",
+    ),
+    (
+        "AR003",
+        "Runtime script uses 'using UnityEditor' without guard",
+        r"(?<!\#if\s+UNITY_EDITOR[^\n]*\n\s*)using\s+UnityEditor\b",
+        SEVERITY_P1,
+        "'using UnityEditor' in runtime scripts causes build failures on device.",
+        "Wrap in #if UNITY_EDITOR / #endif or move to Editor/ folder.",
+    ),
+    (
+        "AR004",
+        "Static mutable field in MonoBehaviour",
+        r"(?:class\s+\w+\s*:\s*MonoBehaviour)[^}]*static\s+(?!readonly|const)[\w<>\[\]]+\s+\w+\s*[;=]",
+        SEVERITY_P1,
+        "Static fields survive scene reloads — subtle state persistence bugs.",
+        "Use instance fields or ScriptableObject data containers.",
+    ),
+    (
+        "AR005",
+        "Class implementing more than 5 interfaces",
+        r"class\s+\w+\s*:\s*(?:\w+\s*,\s*){5,}",
+        SEVERITY_P2,
+        "Many interfaces = too many responsibilities. Violates ISP.",
+        "Split class or consolidate related interfaces.",
+    ),
+    (
+        "AR006",
+        "Namespace declaration (verify folder alignment)",
+        r"namespace\s+\w+",
+        SEVERITY_P2,
+        "Namespace-path mismatch makes files hard to find.",
+        "Align namespace with folder structure.",
+    ),
+]
+
+
+def run_architecture(assets_root: str) -> list:
+    # Architecture rules skip Editor/ folders (matching C# ArchitectureRules.ShouldSkipFile)
+    return _regex_scan(
+        assets_root,
+        CATEGORY_ARCH,
+        ARCHITECTURE_RULES,
+        extra_filter=lambda p: "/Editor/" in p or "\\Editor\\" in p,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optimization Rules  (mirrors OptimizationRules.cs)
+# ---------------------------------------------------------------------------
+
+OPT_RULES = [
+    (
+        "OPT001",
+        "Private method could potentially be static",
+        r"private\s+(?:void|bool|int|float|string|[\w<>\[\]]+)\s+\w+\s*\([^)]*\)\s*\{",
+        SEVERITY_P2,
+        "Non-static methods that don't use instance members mislead about dependencies.",
+        "Add 'static' if no instance members used. Verify manually — this is heuristic.",
+    ),
+    (
+        "OPT002",
+        "Boxing of value type",
+        r"(?:object\s+\w+\s*=\s*(?!null|new)\w+|string\.Format\s*\([^)]*\{0\})",
+        SEVERITY_P1,
+        "Boxing allocates heap object to wrap value type. GC pressure in hot paths.",
+        "Use generic methods/containers instead of object.",
+    ),
+    (
+        "OPT003",
+        "String interpolation or Format in Update/hot paths",
+        r'(?:void\s+(?:Update|FixedUpdate|LateUpdate))[^}]*(?:\$"|string\.Format\s*\()',
+        SEVERITY_P2,
+        "String alloc every frame = thousands of GC objects/sec.",
+        "Cache strings or use StringBuilder. Wrap debug in #if UNITY_EDITOR.",
+    ),
+    (
+        "OPT004",
+        "foreach on non-generic collections (ArrayList, Hashtable)",
+        r"foreach\s*\([^)]*\bin\s+(?:\w+\.)?(?:ArrayList|Hashtable|SortedList)\b",
+        SEVERITY_P2,
+        "Non-generic iteration boxes enumerator and elements.",
+        "Replace: ArrayList->List<T>, Hashtable->Dictionary<K,V>.",
+    ),
+    (
+        "OPT005",
+        "Multiple GetComponent<T>() calls in same method",
+        r"GetComponent\s*<\s*\w+\s*>\s*\(\s*\).*GetComponent\s*<\s*\w+\s*>\s*\(\s*\)",
+        SEVERITY_P2,
+        "Each GetComponent traverses component list. Cache in local variable.",
+        "var rb = GetComponent<Rigidbody>(); then reuse rb.",
+    ),
+    (
+        "OPT006",
+        "SetPixels/SetPixel in loop without batched Apply",
+        r"(?:for|while|foreach)[^{]*\{[^}]*(?:SetPixels?|SetPixel)\s*\(",
+        SEVERITY_P2,
+        "Each SetPixel without batch Apply re-uploads texture to GPU.",
+        "Call SetPixels in batch, then Apply() once.",
+    ),
+    (
+        "OPT007",
+        "Physics cast without explicit layerMask",
+        r"Physics\.(?:Raycast|SphereCast|BoxCast|CapsuleCast)\s*\(\s*[^,)]+,\s*[^,)]+\s*\)",
+        SEVERITY_P1,
+        "Without layerMask, queries check ALL layers — wasted CPU.",
+        "Add layerMask: Physics.Raycast(origin, dir, maxDist, layerMask).",
+    ),
+]
+
+
+def run_optimization(assets_root: str) -> list:
+    return _regex_scan(assets_root, CATEGORY_OPT, OPT_RULES)
 
 
 # ---------------------------------------------------------------------------
@@ -350,8 +778,8 @@ def run_performance(assets_root: str) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 
-def run_prefab(assets_root: str) -> list[Finding]:
-    findings: list[Finding] = []
+def run_prefab(assets_root: str) -> list:
+    findings = []
     exts = ("*.prefab", "*.unity")
 
     for ext in exts:
@@ -376,7 +804,7 @@ def run_prefab(assets_root: str) -> list[Finding]:
                         )
                     )
 
-                # PF002: Canvas without GraphicRaycaster (YAML heuristic)
+                # PF003: Canvas without GraphicRaycaster (YAML heuristic)
                 if "Canvas:" in text and "GraphicRaycaster:" not in text:
                     findings.append(
                         Finding(
@@ -403,15 +831,18 @@ def run_prefab(assets_root: str) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 
-def run_all(assets_root: str) -> list[Finding]:
+def run_all(assets_root: str) -> list:
     runners = [
         run_code_logic,
         run_serialization,
         run_security,
         run_performance,
+        run_lifecycle,
+        run_architecture,
+        run_optimization,
         run_prefab,
     ]
-    findings: list[Finding] = []
+    findings = []
     for runner in runners:
         findings.extend(runner(assets_root))
 
@@ -433,9 +864,9 @@ def run_all(assets_root: str) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 SEVERITY_EMOJI = {
-    SEVERITY_P0: "⛔",
-    SEVERITY_P1: "⚠️ ",
-    SEVERITY_P2: "💡",
+    SEVERITY_P0: "\u26d4",
+    SEVERITY_P1: "\u26a0\ufe0f ",
+    SEVERITY_P2: "\U0001f4a1",
 }
 
 ANSI = {
@@ -455,28 +886,28 @@ def _c(text: str, *codes: str, no_color: bool = False) -> str:
     return "".join(ANSI.get(c, "") for c in codes) + text + ANSI["reset"]
 
 
-def format_terminal(findings: list[Finding], no_color: bool = False) -> str:
+def format_terminal(findings: list, no_color: bool = False) -> str:
     if not findings:
-        return _c("✅  No issues found.", "green", no_color=no_color)
+        return _c("\u2705  No issues found.", "green", no_color=no_color)
 
     lines = []
     lines.append(
         _c(
-            "\n╔══════════════════════════════════════════════╗",
+            "\n\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557",
             "bold",
             no_color=no_color,
         )
     )
     lines.append(
         _c(
-            "║         Unity Auditor Results            ║",
+            "\u2551         Unity Auditor Results            \u2551",
             "bold",
             no_color=no_color,
         )
     )
     lines.append(
         _c(
-            "╚══════════════════════════════════════════════╝\n",
+            "\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n",
             "bold",
             no_color=no_color,
         )
@@ -488,9 +919,9 @@ def format_terminal(findings: list[Finding], no_color: bool = False) -> str:
 
     lines.append(
         f"  Total: {len(findings)}  |  "
-        f"{_c(f'⛔ P0: {len(p0)}', 'red', 'bold', no_color=no_color)}  |  "
-        f"{_c(f'⚠️  P1: {len(p1)}', 'yellow', 'bold', no_color=no_color)}  |  "
-        f"{_c(f'💡 P2: {len(p2)}', 'blue', no_color=no_color)}\n"
+        f"{_c(f'\u26d4 P0: {len(p0)}', 'red', 'bold', no_color=no_color)}  |  "
+        f"{_c(f'\u26a0\ufe0f  P1: {len(p1)}', 'yellow', 'bold', no_color=no_color)}  |  "
+        f"{_c(f'\U0001f4a1 P2: {len(p2)}', 'blue', no_color=no_color)}\n"
     )
 
     current_cat = None
@@ -499,7 +930,7 @@ def format_terminal(findings: list[Finding], no_color: bool = False) -> str:
             current_cat = f.category
             lines.append(
                 _c(
-                    f"\n── {f.category} ────────────────────────────",
+                    f"\n\u2500\u2500 {f.category} \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
                     "bold",
                     no_color=no_color,
                 )
@@ -519,15 +950,17 @@ def format_terminal(findings: list[Finding], no_color: bool = False) -> str:
         )
         lines.append(f"     {_c(f.file_path, 'grey', no_color=no_color)}:{f.line}")
         if f.detail:
-            snippet = f.detail[:80] + ("…" if len(f.detail) > 80 else "")
+            snippet = f.detail[:80] + ("\u2026" if len(f.detail) > 80 else "")
             lines.append(f"     {_c(snippet, 'grey', no_color=no_color)}")
-        lines.append(f"     → {_c(f.how_to_fix[:100], 'green', no_color=no_color)}")
+        lines.append(
+            f"     \u2192 {_c(f.how_to_fix[:100], 'green', no_color=no_color)}"
+        )
         lines.append("")
 
     return "\n".join(lines)
 
 
-def format_github_annotations(findings: list[Finding]) -> str:
+def format_github_annotations(findings: list) -> str:
     """
     GitHub Actions workflow command format.
     https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions
@@ -547,9 +980,9 @@ def format_github_annotations(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-def format_sarif(findings: list[Finding], assets_root: str) -> dict:
+def format_sarif(findings: list, assets_root: str) -> dict:
     """SARIF v2.1 — compatible with GitHub Code Scanning, VS Code SARIF viewer."""
-    rules_map: dict[str, dict] = {}
+    rules_map = {}
     results = []
 
     for f in findings:
@@ -618,7 +1051,7 @@ def format_sarif(findings: list[Finding], assets_root: str) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Unity Auditor — headless static analysis",
+        description="Unity Auditor \u2014 headless static analysis",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -657,6 +1090,9 @@ def main() -> int:
             CATEGORY_PERF,
             CATEGORY_PREFAB,
             CATEGORY_ASSET,
+            CATEGORY_LIFE,
+            CATEGORY_ARCH,
+            CATEGORY_OPT,
         ],
         help="Run only a specific category",
     )

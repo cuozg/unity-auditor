@@ -1,23 +1,18 @@
-using System.Collections.Generic;
-using System.IO;
-using System.Text.RegularExpressions;
-
+#if UNITY_EDITOR
 namespace UnityAuditor.Rules
 {
     /// <summary>
-    /// Scans C# source files for Unity security issues:
-    ///   - PlayerPrefs storing passwords/tokens/secrets
-    ///   - Unencrypted network data (WWW class deprecated)
-    ///   - eval/Reflection.Assembly.Load from external sources
-    ///   - Hardcoded API keys or connection strings
-    ///   - Application.OpenURL with unsanitized input
-    ///   - BinaryFormatter (also flagged in Serialization — P0 here)
+    /// P0/P1 security rules: PlayerPrefs secrets, hardcoded API keys,
+    /// Assembly.Load RCE, Application.OpenURL injection, deprecated WWW, plain HTTP.
     /// </summary>
-    public class SecurityRules : IAuditRule
+    public sealed class SecurityRules : RegexRuleBase
     {
-        public RuleCategory Category => RuleCategory.Security;
+        public override RuleCategory Category => RuleCategory.Security;
 
-        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules =
+        // Security rules scan ALL files including generated code
+        protected override bool ShouldSkipFile(string filePath) => false;
+
+        private static readonly (string id, string title, string pattern, Severity sev, string why, string fix)[] _rules =
         {
             (
                 "SEC001",
@@ -79,50 +74,40 @@ namespace UnityAuditor.Rules
                 "player data, or analytics sent over the wire.",
                 "Use HTTPS for all production endpoints. HTTP is acceptable only for local development."
             ),
+            (
+                "SEC007",
+                "Unsafe JSON deserialization with TypeNameHandling",
+                @"TypeNameHandling\s*\.\s*(?:All|Auto|Objects)",
+                Severity.P0_BlockMerge,
+                "TypeNameHandling.All/Auto/Objects enables type confusion RCE attacks. An attacker can craft " +
+                "JSON payloads that instantiate arbitrary .NET types (e.g., System.Diagnostics.Process) during deserialization.",
+                "Use TypeNameHandling.None (the default and safe setting). If polymorphic deserialization is needed, " +
+                "use a custom SerializationBinder that allowlists known safe types."
+            ),
+            (
+                "SEC008",
+                "File read with variable path — path traversal risk",
+                @"(?:File\.ReadAllText|File\.ReadAllBytes|StreamReader)\s*\(\s*[a-zA-Z_]\w*",
+                Severity.P0_BlockMerge,
+                "File read operations with variable paths are vulnerable to path traversal attacks " +
+                "(../../etc/passwd). If the path comes from user input, save files, or network data, " +
+                "an attacker can read arbitrary files.",
+                "Validate paths against an allowlist of safe directories. Use Path.GetFullPath() and verify the " +
+                "result starts with your expected base directory. Never pass user input directly to file operations."
+            ),
+            (
+                "SEC009",
+                "Process.Start with non-literal arguments — command injection",
+                @"Process\.Start\s*\(\s*[a-zA-Z_]\w*",
+                Severity.P0_BlockMerge,
+                "Process.Start with variable arguments enables command injection. An attacker controlling " +
+                "the argument can execute arbitrary system commands.",
+                "Use ProcessStartInfo with a hardcoded executable path and validate all arguments. " +
+                "Never construct process commands from user input."
+            ),
         };
 
-        public List<AuditFinding> Scan(string assetsRoot)
-        {
-            var findings = new List<AuditFinding>();
-            foreach (var csFile in Directory.GetFiles(assetsRoot, "*.cs", SearchOption.AllDirectories))
-            {
-                var fullText = File.ReadAllText(csFile);
-                var relativePath = MakeRelative(csFile, assetsRoot);
-
-                foreach (var rule in Rules)
-                {
-                    var matches = Regex.Matches(fullText, rule.pattern,
-                        RegexOptions.Singleline | RegexOptions.IgnoreCase);
-
-                    foreach (Match match in matches)
-                    {
-                        findings.Add(new AuditFinding
-                        {
-                            Severity     = rule.sev,
-                            Category     = RuleCategory.Security,
-                            RuleId       = rule.id,
-                            Title        = rule.title,
-                            FilePath     = relativePath,
-                            Line         = CountLines(fullText, match.Index),
-                            Detail       = match.Value.Trim(),
-                            WhyItMatters = rule.why,
-                            HowToFix     = rule.fix,
-                        });
-                    }
-                }
-            }
-            return findings;
-        }
-
-        private static int CountLines(string text, int charIndex)
-        {
-            int line = 1;
-            for (int i = 0; i < charIndex && i < text.Length; i++)
-                if (text[i] == '\n') line++;
-            return line;
-        }
-
-        private static string MakeRelative(string fullPath, string root) =>
-            fullPath.StartsWith(root) ? fullPath.Substring(root.Length).TrimStart('/', '\\') : fullPath;
+        protected override (string id, string title, string pattern, Severity sev, string why, string fix)[] Rules => _rules;
     }
 }
+#endif
